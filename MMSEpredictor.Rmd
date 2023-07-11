@@ -1,0 +1,199 @@
+---
+title: "MMSE predictor model"
+author: "Arin Vansomphone"
+date: "`r Sys.Date()`"
+output: html_document
+---
+## Packages
+```{r}
+# loading packages 
+library(tidyverse)
+library(readr)
+library(caTools)
+library(caret)
+library(glmnet)
+library(faux)
+```
+
+## Importing and tidying data
+```{r}
+upennbiomarkers <- read_csv("UPENNPLASMA_29May2023.csv")
+ADNItraining1 <- read_csv("AD_Challenge_Training_Data_Clinical_Updated_7.22.2014/ADNI_Training_Q3_APOE_CollectionADNI1Complete 1Yr 1.5T_July22.2014.csv")
+ADNItraining2 <- read_csv("AD_Challenge_Training_Data_Clinical_Updated_7.22.2014/ADNI_Training_Q1_APOE_July22.2014.csv")
+blennowplasmatau <- read_csv("BLENNOWPLASMATAU_29May2023.csv")
+RADERlipidomics <- read_csv("ADNI_LIPIDOMICSRADER_29May2023.csv") 
+DESIKANLABPHS <- read_csv("DESIKANLAB_03Jun2023.csv")
+homocys <- read_csv("HCRES_03Jun2023.csv")
+baselinesymptoms <- read_csv("BLSCHECK_08Jul2023.csv")
+neuroexam <- read_csv("NEUROEXM_08JuL2023.csv")
+
+upennbiomarkers <- upennbiomarkers %>%
+  filter(VISCODE == "bl") %>%
+  select(RID, AB40, AB42)
+
+blennowplasmatau <- blennowplasmatau %>%
+  select(RID, PLASMATAU)
+
+RADERlipidomics <- RADERlipidomics %>%
+  select(RID, CHOL, HDL, TG, APOA1, APOE)
+
+ADNItraining1 <- ADNItraining1 %>%
+  select(RID, DX.bl, AGE, PTGENDER, PTEDUCAT, PTETHCAT, PTRACCAT,
+         APOE4, MMSE, `APOE Genotype`) %>%
+  rename(diagnosis = DX.bl)
+
+ADNItraining2 <- ADNItraining2 %>%
+  filter(VISCODE == "m24") %>%
+  select(RID, MMSE) %>%
+  rename(MMSE24 = MMSE)
+
+DESIKANLABPHS <- DESIKANLABPHS %>%
+  select(RID, PHS, CIR)
+
+homocys <- homocys %>%
+  filter(Phase == "ADNI1", VISCODE == "bl") %>%
+  select(RID, HCAMPLAS, HCVOLUME) 
+
+baselinesymptoms <- baselinesymptoms %>%
+  filter(Phase == "ADNI1") %>%
+  select(RID, BCNAUSEA, BCVOMIT, BCDIARRH, BCCONSTP, BCABDOMN, BCSWEATN,
+         BCDIZZY, BCENERGY, BCDROWSY, BCVISION, BCHDACHE, BCDRYMTH, BCBREATH,
+         BCCOUGH, BCPALPIT, BCCHEST, BCURNDIS, BCANKLE, BCMUSCLE, BCRASH, 
+         BCINSOMN, BCDPMOOD, BCCRYING, BCELMOOD, BCWANDER, BCFALL, BCOTHER)
+
+neuroexam <- neuroexam %>%
+  filter(Phase == "ADNI1") %>%
+  select(RID, NXVISUAL, NXAUDITO, NXTREMOR, NXCONSCI, NXNERVE, NXMOTOR, 
+         NXFINGER, NXHEEL, NXSENSOR, NXTENDON, NXPLANTA, NXGAIT, NXOTHER,
+         NXABNORM)
+
+completedata <- left_join(ADNItraining1, upennbiomarkers, 
+                          by = join_by(RID == RID))
+completedata <- left_join(completedata, blennowplasmatau, 
+                          by = join_by(RID == RID))
+completedata <- left_join(completedata, RADERlipidomics,
+                          by = join_by(RID == RID))
+completedata <- left_join(completedata, DESIKANLABPHS,
+                          by = join_by(RID ==RID))
+completedata <- left_join(completedata, homocys,
+                          by = join_by(RID ==RID))
+completedata <- left_join(completedata, baselinesymptoms,
+                          by = join_by(RID ==RID))
+completedata <- left_join(completedata, neuroexam,
+                          by = join_by(RID ==RID))
+completedata <- left_join(completedata, ADNItraining2,
+                          by = join_by(RID == RID))
+
+completedata <- completedata %>% 
+  select(-c(RID, diagnosis, PTRACCAT, PTETHCAT)) %>% 
+   rename(APOEgenotype = `APOE Genotype`) %>%
+  # remove PTRACCAT AND PTETHCAT due to data issues 
+  filter(!APOEgenotype == 22) %>%
+  na.omit()
+  # remove due to data issues
+names <- c(1, 3, 5, 6, 7, 9)
+completedata[,names] <- lapply(completedata[,names], factor)
+completedata$CHOL <- as.numeric(completedata$CHOL)
+completedata$HDL <- as.numeric(completedata$HDL)
+completedata$TG <- as.numeric(completedata$TG)
+completedata$APOA1 <- as.numeric(completedata$APOA1)
+completedata$APOE <- as.numeric(completedata$APOE)
+completedata
+```
+
+## Creating training and testing datasets
+```{r}
+## making train and test datasets
+set.seed(245)
+spl = sample.split(completedata$MMSE24, SplitRatio = 0.7)
+train = subset(completedata, spl == TRUE)
+test = subset(completedata, spl == FALSE)
+
+y <- train$MMSE24
+x <- data.matrix(train[, 1:59])
+x
+```
+
+## Building the model
+```{r}
+cv_model <- cv.glmnet(x, y, alpha = 1)
+
+best_lambda <- cv_model$lambda.min
+
+plot(cv_model)
+```
+```{r}
+best_model <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+coef(best_model)
+
+lasso_train <- train %>%
+  mutate(pred.MMSE24.train = predict(best_model, s = best_lambda, 
+                                     newx = x))
+```
+```{r}
+plot(lasso_train$MMSE24, 
+     lasso_train$pred.MMSE24.train)
+```
+```{r}
+lassomse <- lasso_train %>%
+  mutate(error = pred.MMSE24.train - MMSE24,
+         sq.error = error^2) %>%
+  summarise(mse = mean(sq.error))
+lassormse <- sqrt(lassomse)
+lassormse
+```
+
+```{r}
+lasso_train <- lasso_train %>%
+  mutate(error = pred.MMSE24.train - MMSE24)
+
+ggplot(lasso_train, aes(x = error)) + geom_density()
+```
+```{r}
+bounds_lasso_train <- lasso_train %>%
+  summarise(lb = quantile(error, probs = 0.025),
+            ub = quantile(error, probs = 0.975))
+bounds_lasso_train
+```
+```{r}
+lasso_train <- lasso_train %>%
+  mutate(lb = pred.MMSE24.train + bounds_lasso_train$lb,
+         ub = pred.MMSE24.train + bounds_lasso_train$ub,
+         correctidentification = ifelse(lb < MMSE24 & MMSE24 < ub, "yes", "no"))
+lasso_train
+```
+```{r}
+lasso_train %>%
+  filter(correctidentification == "yes") %>%
+  summarize(correctlyidentified = n() / 210)
+```
+
+## Testing
+```{r}
+z <- data.matrix(test[, 1:59])
+
+lasso_test <- test %>%
+  mutate(pred.MMSE24.test = predict(best_model, s = best_lambda, newx = z),
+         lb = pred.MMSE24.test + bounds_lasso_train$lb,
+         ub = pred.MMSE24.test + bounds_lasso_train$ub)
+lasso_test
+```
+```{r}
+z <- data.matrix(test[, 1:59])
+
+pred_lasso_test <- predict(best_model, s = best_lambda, newx = z)
+lasso_rmse_test <- sqrt(mean((pred_lasso_test - test$MMSE24)^2))
+lasso_rmse_test
+```
+
+```{r}
+lasso_test <- lasso_test %>%
+  mutate(correctidentification = ifelse(lb < MMSE24 & MMSE24 < ub, "yes", "no"))
+lasso_test
+```
+```{r}
+lasso_test %>%
+  filter(correctidentification == "yes") %>%
+  summarize(correctlyidentified = n() / 89)
+```
+

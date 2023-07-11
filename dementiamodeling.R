@@ -1,10 +1,9 @@
-# loading packages 
-library(tidyverse)
-library(readr)
-library(caTools)
-library(caret)
+# loading packages
 library(glmnet)
-library(faux)
+library(randomForest)
+library(ranger)
+library(tidymodels)
+library(readr)
 
 # importing and tidying the data
 upennbiomarkers <- read_csv("R work/dementia modeling/UPENNPLASMA_29May2023.csv")
@@ -14,6 +13,8 @@ blennowplasmatau <- read_csv("R work/dementia modeling/BLENNOWPLASMATAU_29May202
 RADERlipidomics <- read_csv("R work/dementia modeling/ADNI_LIPIDOMICSRADER_29May2023.csv") 
 DESIKANLABPHS <- read_csv("R work/dementia modeling/DESIKANLAB_03Jun2023.csv")
 homocys <- read_csv("R work/dementia modeling/HCRES_03Jun2023.csv")
+baselinesymptoms <- read_csv("R work/dementia modeling/BLSCHECK_08Jul2023.csv")
+neuroexam <- read_csv("R work/dementia modeling/NEUROEXM_08JuL2023.csv")
 
 upennbiomarkers <- upennbiomarkers %>%
   filter(VISCODE == "bl") %>%
@@ -42,6 +43,19 @@ homocys <- homocys %>%
   filter(Phase == "ADNI1", VISCODE == "bl") %>%
   select(RID, HCAMPLAS, HCVOLUME) 
 
+baselinesymptoms <- baselinesymptoms %>%
+  filter(Phase == "ADNI1") %>%
+  select(RID, BCNAUSEA, BCVOMIT, BCDIARRH, BCCONSTP, BCABDOMN, BCSWEATN,
+         BCDIZZY, BCENERGY, BCDROWSY, BCVISION, BCHDACHE, BCDRYMTH, BCBREATH,
+         BCCOUGH, BCPALPIT, BCCHEST, BCURNDIS, BCANKLE, BCMUSCLE, BCRASH, 
+         BCINSOMN, BCDPMOOD, BCCRYING, BCELMOOD, BCWANDER, BCFALL, BCOTHER)
+
+neuroexam <- neuroexam %>%
+  filter(Phase == "ADNI1") %>%
+  select(RID, NXVISUAL, NXAUDITO, NXTREMOR, NXCONSCI, NXNERVE, NXMOTOR, 
+         NXFINGER, NXHEEL, NXSENSOR, NXTENDON, NXPLANTA, NXGAIT, NXOTHER,
+         NXABNORM)
+
 completedata <- left_join(ADNItraining1, upennbiomarkers, 
                           by = join_by(RID == RID))
 completedata <- left_join(completedata, blennowplasmatau, 
@@ -52,12 +66,20 @@ completedata <- left_join(completedata, DESIKANLABPHS,
                           by = join_by(RID ==RID))
 completedata <- left_join(completedata, homocys,
                           by = join_by(RID ==RID))
+completedata <- left_join(completedata, baselinesymptoms,
+                          by = join_by(RID ==RID))
+completedata <- left_join(completedata, neuroexam,
+                          by = join_by(RID ==RID))
 completedata <- left_join(completedata, ADNItraining2,
                           by = join_by(RID == RID))
 
 completedata <- completedata %>% 
-  select(-RID) %>%
-  rename(APOEgenotype = `APOE Genotype`)
+  select(-c(RID, diagnosis, PTRACCAT, PTETHCAT)) %>% 
+  rename(APOEgenotype = `APOE Genotype`) %>%
+  # remove PTRACCAT AND PTETHCAT due to data issues 
+  filter(!APOEgenotype == 22) %>%
+  na.omit()
+  # remove due to data issues
 names <- c(1, 3, 5, 6, 7, 9)
 completedata[,names] <- lapply(completedata[,names], factor)
 completedata$CHOL <- as.numeric(completedata$CHOL)
@@ -65,148 +87,85 @@ completedata$HDL <- as.numeric(completedata$HDL)
 completedata$TG <- as.numeric(completedata$TG)
 completedata$APOA1 <- as.numeric(completedata$APOA1)
 completedata$APOE <- as.numeric(completedata$APOE)
-completedata <- completedata %>%
-  na.omit()
 
-# logistic regression model 
-## more tidying and making variables factors
-completedata$diagnosis <- str_replace(completedata$diagnosis, "LMCI", "AD")
-completedata$diagnosis <- as.factor(completedata$diagnosis)
+# splitting training and testing data
+set.seed(4595)
+data_split <- initial_split(completedata, strata = "MMSE24", prop = 0.75)
 
-## train test set creation 
-set.seed(100)
-spl = sample.split(completedata$diagnosis, SplitRatio = 0.7)
-train = subset(completedata, spl == TRUE)
-test = subset(completedata, spl == FALSE)
+train <- training(data_split)
+test <- testing(data_split)
 
-## model creation 
-model_glm = glm(diagnosis ~ ., family = "binomial", data = train)
-summary(model_glm)
+# random forest model 
+rf_defaults <- rand_forest(mode = "regression")
 
-## predictions on the training set
-predictTrain = predict(model_glm, data = train, type = "response")
-train_and_predictions <- train %>%
-  mutate(predicttrain = predictTrain)
+preds <- colnames(completedata)[1:59]
 
-## confusion matrix on training data
-table(train$diagnosis, predictTrain >= 0.5)
-(165+89)/nrow(train) ### 87% accuracy 
+rf_xy_fit <- 
+  rf_defaults %>%
+  set_engine("ranger") %>%
+  fit_xy(
+    x = train[, preds],
+    y = log10(train$MMSE24)
+  )
 
-## predictions on the test set
-predictTest = predict(model_glm, newdata = test, type = "response")
+test_results <-
+  test %>%
+  select(MMSE24) %>%
+  mutate(MMSE24 = log10(MMSE24)) %>%
+  bind_cols(
+    predict(rf_xy_fit, new_data = test[, preds])
+  )
+test_results %>% slice(1:5)
 
-## confusion matrix on the test set
-table(test$diagnosis, predictTest >= 0.5)
-(70+38)/nrow(test) ### 83% accuracy
+## summarize performance 
+test_results %>% metrics(truth = MMSE24, estimate = .pred)
 
-# decision tree
-## making train and test datasets
-set.seed(245)
-spl = sample.split(completedata$diagnosis, SplitRatio = 0.7)
-train = subset(completedata, spl == TRUE)
-test = subset(completedata, spl == FALSE)
+rand_forest(mode = "regression", mtry = .preds(), trees = 1000) %>%
+  set_engine("ranger") %>%
+  fit(
+    log10(MMSE24) ~ .,
+    data = train
+  )
 
-## training the network
-library(rpart)
-library(rpart.plot)
+# Regularization
+norm_recipe <-
+  recipe(
+    MMSE24 ~ .,
+    data = train
+  ) %>%
+  step_dummy(all_nominal()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_log(MMSE24, base = 10) %>%
+  prep(training = train, retain = TRUE)
 
-fit <- rpart(diagnosis ~ ., data = train, method = 'class')
-rpart.plot(fit, extra = 106)
+## fit model using processed version of data
+glmn_fit <- 
+  linear_reg(penalty = 0.001, mixture = 0.5) %>%
+  set_engine("glmnet") %>%
+  fit(MMSE24 ~., data = bake(norm_recipe, new_data = NULL))
+glmn_fit
 
-predict_unseen <- predict(fit, test, type = 'class')
+# finding predictions for glmn
+test_normalized <- bake(norm_recipe, new_data = test, all_predictors())
 
-table_mat <- table(test$diagnosis, predict_unseen)
-table_mat
-sum(diag(table_mat)) / sum(table_mat) ### 75% accuracy
+test_results <-
+  test_results %>%
+  rename(`random forest` = .pred) %>%
+  bind_cols(
+    predict(glmn_fit, new_data = test_normalized) %>%
+      rename(glmnet = .pred)
+  )
+test_results
 
-## tuning
-accuracy_tune <- function(fit) {
-  predict_unseen <- predict(fit, test, type = 'class')
-  table_mat <- table(test$diagnosis, predict_unseen)
-  accuracy_Test <- sum(diag(table_mat)) / sum(table_mat)
-  accuracy_Test
-}
-control <- rpart.control(minsplit = 4, minbucket = round(5 / 3), maxdepth = 3,
-                         cp = 0)
-tune_fit <- rpart(diagnosis ~ ., data = train, method = 'class',
-                  control = control)
-accuracy_tune(tune_fit) ### 67% accuracy, worsens with tuning 
+test_results %>% metrics(truth = MMSE24, estimate = glmnet)
 
-# multivariate multiple regression model
-## simulating more data 
-simulateddata <- sim_df(completedata, 1000)
+test_results %>%
+  gather(model, prediction, -MMSE24) %>%
+  ggplot(aes(x = prediction, y = MMSE24)) +
+  geom_abline(col = "green", lty = 2) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~model) +
+  coord_fixed()
 
-## removing categorical variables and joining with actual data
-simulateddataregression <- completedata %>%
-  select(-c(diagnosis, PTRACCAT, PTGENDER, PTETHCAT, APOEgenotype, APOE4))
-simulateddata <- simulateddata %>%
-  select(-c(id))
-totalsimulated <- rbind(simulateddataregression, simulateddata)
-
-## select factors desired
-completedataregression <- completedata %>%
-  select(-c(diagnosis, PTRACCAT)) %>%
-  filter(!APOEgenotype == 22)
-
-## making train and test datasets
-set.seed(245)
-spl = sample.split(totalsimulated$MMSE24, SplitRatio = 0.7)
-train = subset(totalsimulated, spl == TRUE)
-test = subset(totalsimulated, spl == FALSE)
-
-mlml <- lm(MMSE24 ~ ., data = train)
-summary(mlml)$coefficient
-sigma(mlml) / mean(train$MMSE24)
-
-## RMSE = root mean square error
-simulatedregression_rmse_train <- train %>%
-  mutate(pred.MMSE24.train = predict(mlml))
-
-plot(simulatedregression_rmse_train$MMSE24, 
-     simulatedregression_rmse_train$pred.MMSE24.train)
-
-mse <- simulatedregression_rmse_train %>%
-  mutate(error = pred.MMSE24.train - MMSE24,
-         sq.error = error^2) %>%
-  summarise(mse = mean(sq.error))
-rmse <- sqrt(mse) ### training rmse = 3.50
-rmse
-
-## check rmse on test data
-pred_reg_test <- predict(mlml, newdata = test)
-reg_rmse_test <- sqrt(mean((pred_reg_test - test$MMSE24)^2))
-reg_rmse_test ### test rmse = 3.43
-
-## LASSO model
-y <- train$MMSE24
-x <- data.matrix(train[, 1:15])
-cv_model <- cv.glmnet(x, y, alpha = 1)
-
-best_lambda <- cv_model$lambda.min
-best_lambda
-
-plot(cv_model)
-
-best_model <- glmnet(x, y, alpha = 1, lambda = best_lambda)
-coef(best_model)
-
-simulatedlasso_rmse_train <- train %>%
-  mutate(pred.MMSE24.train = predict(best_model, s = best_lambda, 
-                                     newx = x))
-
-## RMSE of LASSO model
-plot(simulatedlasso_rmse_train$MMSE24, 
-     simulatedlasso_rmse_train$pred.MMSE24.train)
-
-lassomse <- simulatedlasso_rmse_train %>%
-  mutate(error = pred.MMSE24.train - MMSE24,
-         sq.error = error^2) %>%
-  summarise(mse = mean(sq.error))
-lassormse <- sqrt(lassomse) ### training rmse = 3.42
-
-## check RMSE on test data 
-z <- data.matrix(test[, 1:15])
-
-pred_lasso_test <- predict(best_model, s = best_lambda, newx = z)
-lasso_rmse_test <- sqrt(mean((pred_lasso_test - test$MMSE24)^2))
-lasso_rmse_test ### test rmse = 3.23
+# https://www.tidymodels.org/start/resampling/
